@@ -1,0 +1,22 @@
+#define MQ135_DOUT 26
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(MQ135_DOUT, INPUT);
+  Serial.println("MQ-135 Test Starting...");
+  Serial.println("Warming up sensor - wait 20 seconds");
+  delay(20000);
+  Serial.println("Ready!");
+}
+
+void loop() {
+  int digitalVal = digitalRead(MQ135_DOUT);
+  
+  if (digitalVal == LOW) {
+    Serial.println("WARNING: Gas detected! Air quality POOR");
+  } else {
+    Serial.println("Air quality GOOD");
+  }
+  
+  delay(1000);
+}
