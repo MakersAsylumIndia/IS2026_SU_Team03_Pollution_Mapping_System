@@ -1,0 +1,44 @@
+#define UV_OUT 32
+#define REF_3V3 33
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ML8511 UV Sensor Test Starting...");
+  delay(1000);
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+void loop() {
+  int uvRaw = analogRead(UV_OUT);
+  int refRaw = analogRead(REF_3V3);
+  
+  float refVoltage = 3.3;
+  float uvVoltage = refVoltage / refRaw * uvRaw;
+  
+  float uvIntensity = mapFloat(uvVoltage, 0.99, 2.9, 0.0, 15.0);
+  uvIntensity = constrain(uvIntensity, 0.0, 15.0);
+  
+  Serial.print("UV Voltage: ");
+  Serial.print(uvVoltage, 2);
+  Serial.println(" V");
+  
+  Serial.print("UV Intensity: ");
+  Serial.print(uvIntensity, 1);
+  Serial.println(" mW/cm²");
+  
+  if (uvIntensity < 3.0) {
+    Serial.println("UV Index: LOW");
+  } else if (uvIntensity < 6.0) {
+    Serial.println("UV Index: MODERATE");
+  } else if (uvIntensity < 10.0) {
+    Serial.println("UV Index: HIGH");
+  } else {
+    Serial.println("UV Index: VERY HIGH");
+  }
+  
+  Serial.println("----------");
+  delay(1000);
+}
