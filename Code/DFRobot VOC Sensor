@@ -1,0 +1,29 @@
+#define VOC_AOUT 34
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("VOC Sensor Test Starting...");
+  delay(1000);
+}
+
+void loop() {
+  int rawValue = analogRead(VOC_AOUT);
+  float voltage = rawValue * (3.3 / 4095.0);
+  
+  Serial.print("Raw ADC: ");
+  Serial.print(rawValue);
+  Serial.print(" | Voltage: ");
+  Serial.print(voltage, 2);
+  Serial.println(" V");
+  
+  if (voltage > 2.0) {
+    Serial.println("WARNING: High VOC detected!");
+  } else if (voltage > 1.0) {
+    Serial.println("MODERATE: Some VOCs present");
+  } else {
+    Serial.println("GOOD: Air clean");
+  }
+  
+  Serial.println("----------");
+  delay(1000);
+}
