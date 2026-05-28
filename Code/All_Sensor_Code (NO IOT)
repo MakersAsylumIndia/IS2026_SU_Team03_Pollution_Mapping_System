@@ -8,7 +8,7 @@
 #define DHTTYPE       DHT22
 #define VOC_PIN       34    // Fermion VOC AOUT  (ADC1) (VCC = 5V)
 #define UV_PIN        33    // ML8511 OUT        (ADC1) (VIN = 3V3)
-#define UV_REF_PIN    26    // ML8511 3.3V / REF (ADC2) -> Connect directly to ESP32 D26!
+#define UV_REF_PIN    27    // ML8511 3.3V / REF (ADC2) -> Connect directly to ESP32 D26!
 #define MQ135_PIN     35    // MQ-135 AOUT       (ADC1) (VCC = 5V)
 #define LED_POWER     2     // Power indicator LED (solid ON via D2 to 330Ω to GND)
 
