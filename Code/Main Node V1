@@ -1,0 +1,223 @@
+/*
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║              HUB NODE  —  ESP-NOW RECEIVER               ║
+ * ║                                                          ║
+ * ║  Listens for SensorPacket structs from any registered    ║
+ * ║  sensor node and prints a full dashboard per packet.     ║
+ * ║                                                          ║
+ * ║  SETUP:                                                  ║
+ * ║  1. Flash this sketch first.                             ║
+ * ║  2. Open Serial at 115200 — it will print this hub's     ║
+ * ║     MAC address on boot.                                 ║
+ * ║  3. Paste that MAC into HUB_MAC[] in each sensor node.   ║
+ * ╚══════════════════════════════════════════════════════════╝
+ */
+
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ══════════════════════════════════════════════
+//  SHARED DATA PACKET  (must match sensor nodes)
+// ══════════════════════════════════════════════
+typedef struct SensorPacket {
+  uint8_t  nodeId;
+  float    tempC;
+  float    humidity;
+  float    heatIndex;
+  float    vocVoltage;
+  float    vocDelta;
+  float    uvIndex;
+  float    uvVoltage;
+  float    uvRefVoltage;
+  float    mq135PPM;
+  float    mq135Voltage;
+  int      vocRaw;
+  int      uvRaw;
+  int      mqRaw;
+} SensorPacket;
+
+// ══════════════════════════════════════════════
+//  LEVEL STRINGS  (mirrored from sensor node)
+// ══════════════════════════════════════════════
+String getHeatIndexLevel(float hi) {
+  if      (hi < 27) return "Comfortable  ✔";
+  else if (hi < 32) return "Warm         ⚠";
+  else if (hi < 40) return "Hot          ✘";
+  else              return "Danger       ✘✘";
+}
+
+String getVOCLevel(float delta) {
+  float d = abs(delta);
+  if      (d < 0.05) return "Clean Air    ✔✔";
+  else if (d < 0.15) return "Good         ✔";
+  else if (d < 0.30) return "Moderate     ⚠";
+  else if (d < 0.50) return "Poor         ✘";
+  else               return "Hazardous    ✘✘";
+}
+
+String getUVLevel(float uv) {
+  if      (uv < 3)  return "Low          ✔✔ (0-2)";
+  else if (uv < 6)  return "Moderate     ✔  (3-5)";
+  else if (uv < 8)  return "High         ⚠  (6-7)";
+  else if (uv < 11) return "Very High    ✘  (8-10)";
+  else              return "Extreme      ☠  (11+)";
+}
+
+String getMQ135Level(float ppm) {
+  if      (ppm < 450)  return "Excellent    ✔✔ (<450 ppm)";
+  else if (ppm < 1000) return "Good         ✔  (450-1000 ppm)";
+  else if (ppm < 2000) return "Moderate     ⚠  (1000-2000 ppm)";
+  else if (ppm < 5000) return "Poor         ✘  (2000-5000 ppm)";
+  else                 return "Hazardous    ✘✘ (>5000 ppm)";
+}
+
+// ══════════════════════════════════════════════
+//  RECEIVE CALLBACK
+// ══════════════════════════════════════════════
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(SensorPacket)) {
+    Serial.printf("[HUB] Unexpected packet size %d (expected %d) — ignored.\n",
+                  len, sizeof(SensorPacket));
+    return;
+  }
+
+  SensorPacket p;
+  memcpy(&p, data, sizeof(p));
+
+  // Print sender MAC
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2],
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+
+  Serial.println("\n##############################################");
+  Serial.printf( "#   LIVE DATA — NODE %d   (MAC: %s)\n", p.nodeId, macStr);
+  Serial.println("##############################################");
+
+  // ── DHT22 ──────────────────────────────────
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|      TEMPERATURE & HUMIDITY  (DHT22)       |");
+  Serial.println("+--------------------------------------------+");
+  if (isnan(p.tempC) || isnan(p.humidity)) {
+    Serial.println("|  ✘ DHT22 read failed on remote node.       |");
+  } else {
+    float tempF = p.tempC * 9.0 / 5.0 + 32.0;
+    Serial.printf("|  Temperature  : %.2f C  /  %.2f F\n",  p.tempC, tempF);
+    Serial.printf("|  Humidity     : %.2f %%\n",              p.humidity);
+    Serial.printf("|  Heat Index   : %.2f C\n",               p.heatIndex);
+    Serial.print( "|  Feels Like   : ");
+    Serial.println(getHeatIndexLevel(p.heatIndex));
+  }
+
+  // ── VOC ────────────────────────────────────
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|       VOC AIR QUALITY  (Fermion MEMS)      |");
+  Serial.println("+--------------------------------------------+");
+  Serial.printf( "|  Raw ADC      : %d\n",           p.vocRaw);
+  Serial.printf( "|  Voltage      : %.4f V\n",       p.vocVoltage);
+  Serial.printf( "|  Delta        : %.4f V from baseline\n", p.vocDelta);
+  Serial.print(  "|  Air Quality  : ");
+  Serial.println(getVOCLevel(p.vocDelta));
+
+  // ── UV ─────────────────────────────────────
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|          UV INDEX  (ML8511)                |");
+  Serial.println("+--------------------------------------------+");
+  Serial.printf( "|  Raw ADC      : %d\n",           p.uvRaw);
+  Serial.printf( "|  Out Voltage  : %.4f V\n",       p.uvVoltage);
+  Serial.printf( "|  Ref Voltage  : %.4f V\n",       p.uvRefVoltage);
+  Serial.printf( "|  UV Index     : %.2f UV\n",      p.uvIndex);
+  Serial.print(  "|  Risk Level   : ");
+  Serial.println(getUVLevel(p.uvIndex));
+
+  // ── MQ-135 ─────────────────────────────────
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|       CO2 / AIR QUALITY  (MQ-135)          |");
+  Serial.println("+--------------------------------------------+");
+  Serial.printf( "|  Raw ADC      : %d\n",           p.mqRaw);
+  Serial.printf( "|  Voltage      : %.4f V\n",       p.mq135Voltage);
+  Serial.printf( "|  Est. CO2     : %.2f ppm\n",     p.mq135PPM);
+  Serial.print(  "|  Air Quality  : ");
+  Serial.println(getMQ135Level(p.mq135PPM));
+
+  // ── Advice ─────────────────────────────────
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|                 ADVICE                     |");
+  Serial.println("+--------------------------------------------+");
+
+  bool allGood = true;
+
+  if (!isnan(p.humidity)) {
+    if (p.humidity > 85) {
+      Serial.println("|  ⚠ Very high humidity — risk of mold.     |");
+      allGood = false;
+    } else if (p.humidity > 75) {
+      Serial.println("|  i  Humidity elevated — normal for Goa.   |");
+    }
+  }
+  if (!isnan(p.tempC) && p.tempC > 35) {
+    Serial.println("|  ⚠ High temp — drink water frequently!     |");
+    allGood = false;
+  }
+  if (abs(p.vocDelta) >= 0.30) {
+    Serial.println("|  ✘ Elevated VOC — open windows!            |");
+    allGood = false;
+  }
+  if (p.uvIndex >= 20) {
+    Serial.println("|  ☠ EXTREME UV — stay indoors!              |");
+    allGood = false;
+  } else if (p.uvIndex >= 8) {
+    Serial.println("|  ⚠ High UV rays — apply sunscreen.        |");
+    allGood = false;
+  } else if (p.uvIndex >= 6) {
+    Serial.println("|  i  Moderate UV — some protection needed.  |");
+    allGood = false;
+  }
+  if (p.mq135PPM >= 2000) {
+    Serial.println("|  ✘ Poor CO2 levels — ventilate now!        |");
+    allGood = false;
+  } else if (p.mq135PPM >= 1000) {
+    Serial.println("|  ⚠ Moderate CO2 — open a window.          |");
+    allGood = false;
+  }
+  if (allGood) {
+    Serial.println("|  ✔ All readings normal — conditions good!  |");
+  }
+
+  Serial.println("+--------------------------------------------+");
+}
+
+// ══════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // Print this hub's MAC — copy it into each sensor node's HUB_MAC[]
+  Serial.println("\n##############################################");
+  Serial.println("#        HUB NODE  —  ESP-NOW RECEIVER      #");
+  Serial.println("##############################################");
+  Serial.print("  This hub's MAC address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("  Copy the MAC above into HUB_MAC[] on every sensor node.");
+  Serial.println("##############################################\n");
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[HUB] ESP-NOW init FAILED — halting.");
+    while (true) delay(1000);
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  Serial.println("[HUB] Listening for sensor nodes...");
+}
+
+// ══════════════════════════════════════════════
+//  LOOP  — all work done in the callback
+// ══════════════════════════════════════════════
+void loop() {
+  delay(1000);
+}
