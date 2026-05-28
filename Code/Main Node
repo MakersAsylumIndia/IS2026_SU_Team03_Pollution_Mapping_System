@@ -1,0 +1,262 @@
+/*
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║         HUB NODE  —  ESP-NOW + WEB DASHBOARD            ║
+ * ║                                                          ║
+ * ║  1. Receives sensor packets from all sensor nodes        ║
+ * ║  2. Connects to your WiFi                                ║
+ * ║  3. Hosts a live Leaflet map dashboard at its IP         ║
+ * ║                                                          ║
+ * ║  SETUP:                                                  ║
+ * ║  - Fill in WIFI_SSID and WIFI_PASS below                 ║
+ * ║  - Set each node's GPS coords in NODE_LOCATIONS[]        ║
+ * ║  - Open Serial at 115200 to see the hub's IP address     ║
+ * ║  - Visit that IP in any browser on the same network      ║
+ * ╚══════════════════════════════════════════════════════════╝
+ *
+ *  Libraries needed (Arduino IDE Library Manager):
+ *    - ESPAsyncWebServer  (by lacamera or me-no-dev)
+ *    - AsyncTCP           (by dvarrel or me-no-dev)
+ *    - DHT sensor library (Adafruit) — not used here but
+ *      keep installed for sensor nodes
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+// ══════════════════════════════════════════════
+//  CONFIG — fill these in
+// ══════════════════════════════════════════════
+#define WIFI_SSID   "MakersAsylum_IoT"
+#define WIFI_PASS   "Makeithappen"
+
+// GPS coordinates for each node ID (index = nodeId)
+// Index 0 unused. Add/edit entries for your actual locations.
+struct NodeLocation {
+  uint8_t id;
+  float   lat;
+  float   lng;
+  const char* label;
+};
+
+NodeLocation NODE_LOCATIONS[] = {
+  { 1,  15.5957,  73.7396, "Node 1 — Living Room"  },
+  { 2,  15.5960,  73.7400, "Node 2 — Bedroom"      },
+  { 3,  15.5954,  73.7390, "Node 3 — Kitchen"      },
+  // Add more nodes here as needed
+};
+const int NUM_NODES = sizeof(NODE_LOCATIONS) / sizeof(NODE_LOCATIONS[0]);
+
+// ══════════════════════════════════════════════
+//  SHARED DATA PACKET  (must match sensor nodes)
+// ══════════════════════════════════════════════
+typedef struct SensorPacket {
+  uint8_t  nodeId;
+  float    tempC;
+  float    humidity;
+  float    heatIndex;
+  float    vocVoltage;
+  float    vocDelta;
+  float    uvIndex;
+  float    uvVoltage;
+  float    uvRefVoltage;
+  float    mq135PPM;
+  float    mq135Voltage;
+  int      vocRaw;
+  int      uvRaw;
+  int      mqRaw;
+} SensorPacket;
+
+// ══════════════════════════════════════════════
+//  STORED DATA  (last reading per node, up to 20)
+// ══════════════════════════════════════════════
+#define MAX_NODES 20
+SensorPacket nodeData[MAX_NODES];
+bool         nodeActive[MAX_NODES] = { false };
+unsigned long lastSeen[MAX_NODES]  = { 0 };
+
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
+
+// ══════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════
+// Returns "green", "yellow", or "red" for each reading
+String colorForHeatIndex(float hi) {
+  if (isnan(hi))   return "grey";
+  if (hi < 27)     return "green";
+  if (hi < 40)     return "yellow";
+  return "red";
+}
+String colorForVOC(float delta) {
+  float d = abs(delta);
+  if (d < 0.15)    return "green";
+  if (d < 0.50)    return "yellow";
+  return "red";
+}
+String colorForUV(float uv) {
+  if (isnan(uv))   return "grey";
+  if (uv < 3)      return "green";
+  if (uv < 8)      return "yellow";
+  return "red";
+}
+String colorForCO2(float ppm) {
+  if (isnan(ppm))  return "grey";
+  if (ppm < 1000)  return "green";
+  if (ppm < 2000)  return "yellow";
+  return "red";
+}
+// Overall worst color for map pin
+String worstColor(SensorPacket &p) {
+  auto rank = [](String c) {
+    if (c == "red")    return 2;
+    if (c == "yellow") return 1;
+    return 0;
+  };
+  int r = 0;
+  r = max(r, rank(colorForHeatIndex(p.heatIndex)));
+  r = max(r, rank(colorForVOC(p.vocDelta)));
+  r = max(r, rank(colorForUV(p.uvIndex)));
+  r = max(r, rank(colorForCO2(p.mq135PPM)));
+  if (r == 2) return "red";
+  if (r == 1) return "yellow";
+  return "green";
+}
+
+NodeLocation* locationFor(uint8_t id) {
+  for (int i = 0; i < NUM_NODES; i++)
+    if (NODE_LOCATIONS[i].id == id) return &NODE_LOCATIONS[i];
+  return nullptr;
+}
+
+// Build full JSON payload of all active nodes
+String buildJSON() {
+  JsonDocument doc;
+  JsonArray arr = doc["nodes"].to<JsonArray>();
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodeActive[i]) continue;
+    SensorPacket &p = nodeData[i];
+    NodeLocation *loc = locationFor(p.nodeId);
+    JsonObject obj = arr.add<JsonObject>();
+    obj["id"]          = p.nodeId;
+    obj["lat"]         = loc ? loc->lat   : 15.5957;
+    obj["lng"]         = loc ? loc->lng   : 73.7396;
+    obj["label"]       = loc ? loc->label : "Unknown node";
+    obj["tempC"]       = isnan(p.tempC)     ? 0 : (float)round(p.tempC * 100) / 100;
+    obj["humidity"]    = isnan(p.humidity)  ? 0 : (float)round(p.humidity * 100) / 100;
+    obj["heatIndex"]   = isnan(p.heatIndex) ? 0 : (float)round(p.heatIndex * 100) / 100;
+    obj["vocDelta"]    = (float)round(p.vocDelta * 10000) / 10000;
+    obj["uvIndex"]     = (float)round(p.uvIndex * 100) / 100;
+    obj["mq135PPM"]    = (float)round(p.mq135PPM * 10) / 10;
+    obj["colorTemp"]   = colorForHeatIndex(p.heatIndex);
+    obj["colorVOC"]    = colorForVOC(p.vocDelta);
+    obj["colorUV"]     = colorForUV(p.uvIndex);
+    obj["colorCO2"]    = colorForCO2(p.mq135PPM);
+    obj["colorPin"]    = worstColor(p);
+    obj["lastSeen"]    = (millis() - lastSeen[i]) / 1000;
+  }
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// ══════════════════════════════════════════════
+//  ESP-NOW RECEIVE CALLBACK
+// ══════════════════════════════════════════════
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(SensorPacket)) return;
+  SensorPacket p;
+  memcpy(&p, data, sizeof(p));
+  if (p.nodeId == 0 || p.nodeId >= MAX_NODES) return;
+
+  nodeData[p.nodeId]   = p;
+  nodeActive[p.nodeId] = true;
+  lastSeen[p.nodeId]   = millis();
+
+  Serial.printf("[HUB] Packet from Node %d  temp=%.1fC  CO2=%.0fppm  UV=%.1f\n",
+                p.nodeId, p.tempC, p.mq135PPM, p.uvIndex);
+
+  // Push update to all open browsers via SSE
+  events.send(buildJSON().c_str(), "update", millis());
+}
+
+// ══════════════════════════════════════════════
+//  HTML PAGE  (stored in flash via PROGMEM)
+// ══════════════════════════════════════════════
+
+evtSource.onerror = () => {
+  statusDot.classList.remove('live');
+  statusText.textContent = 'RECONNECTING...';
+#include "webpage_html.h"
+
+// ══════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  memset(nodeActive, false, sizeof(nodeActive));
+
+  // ── WiFi ─────────────────────────────────
+  WiFi.mode(WIFI_AP_STA);   // AP_STA lets ESP-NOW and WiFi STA coexist
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[HUB] Connecting to WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500); Serial.print("."); tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[HUB] WiFi connected!");
+    Serial.print("[HUB] Dashboard URL: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[HUB] WiFi FAILED — check SSID/password. Running without web server.");
+  }
+
+  // ── Print hub MAC (for sensor nodes) ────
+  Serial.print("[HUB] This hub's MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  // ── ESP-NOW ───────────────────────────────
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[HUB] ESP-NOW init FAILED.");
+    while (true) delay(1000);
+  }
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("[HUB] ESP-NOW listening...");
+
+  // ── Web server routes ─────────────────────
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send(200, "application/json", buildJSON());
+  });
+
+  // SSE endpoint — browser connects once, hub pushes updates
+  events.onConnect([](AsyncEventSourceClient *client) {
+    Serial.println("[HUB] Browser connected to dashboard.");
+    // Send current state immediately on connect
+    // (short delay so client finishes handshake first)
+  });
+  server.addHandler(&events);
+
+  server.begin();
+  Serial.println("[HUB] Web server started.");
+}
+
+// ══════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════
+void loop() {
+  // Update lastSeen ages on the page every 5 seconds
+  static unsigned long lastPush = 0;
+  if (millis() - lastPush > 5000) {
+    lastPush = millis();
+    bool anyActive = false;
+    for (int i = 0; i < MAX_NODES; i++) if (nodeActive[i]) { anyActive = true; break; }
+    if (anyActive) events.send(buildJSON().c_str(), "update", millis());
+  }
+}
