@@ -32,7 +32,7 @@ uint8_t HUB_MAC[6] = {0x78, 0x1C, 0x3C, 0xB7, 0x99, 0x9C};
 #define DHTTYPE       DHT22
 #define VOC_PIN       34
 #define UV_PIN        33
-#define UV_REF_PIN    26
+#define UV_REF_PIN    27
 #define UV_EN_PIN     32
 #define MQ135_PIN     35
 #define LED_POWER     2
