@@ -1,6 +1,17 @@
 ﻿Name of the Material/Component,Quantity,Reference Link,Additional Note
-,,,
-,,,
-,,,
-,,,
-,,,
+ ESP 32.      OK	5		Microcontroller	
+ Veroboard    OK	5			
+Male pin headers (strip).  OK	5			
+ Female pin hearders(strip) OK	5			
+LEDs.         OK	6		Power + WiFi indicator
+330惟 resistors.     OK 	6		For LEDs	
+100nF decoupling capacitors. OK	10			
+USB power bank.  OK	1			
+MQ-135.        OK	6		CO2 Sensor	
+DHT22.  OK	6		Temperature + Humidity Sensor	
+ VOC Gas sensors OK	4		VOCs/Organic Vapors Sensor	
+ML8511.  OK	4		UV Sensor	
+Slide power switch ok	4			
+10k惟 resistor OK	4		for DHT22	
+Jumper wires assortment (M-M + M-F) ok				
+Heat shrink tubing assortment OK			
