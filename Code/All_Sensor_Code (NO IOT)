@@ -209,7 +209,7 @@ void loop() {
   Serial.println("|       VOC AIR QUALITY  (Fermion MEMS)      |");
   Serial.println("+--------------------------------------------+");
   Serial.print("|  Raw ADC      : "); Serial.println(vocRaw);
-  Serial.print("|  Voltage      : "); Magic_Print = Serial.print(vocVoltage, 4); Serial.println(" V");
+  Serial.print("|  Voltage      : "); Serial.print(vocVoltage, 4); Serial.println(" V");
   Serial.print("|  Delta        : "); Serial.print(vocDelta,   4); Serial.println(" V from baseline");
   Serial.print("|  Air Quality  : "); Serial.println(vocLevel);
 
