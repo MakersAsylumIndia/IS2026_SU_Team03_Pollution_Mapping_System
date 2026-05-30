@@ -1,0 +1,213 @@
+/*
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║           SENSOR NODE  —  ESP-NOW TRANSMITTER           ║
+ * ║                                                          ║
+ * ║  Reads DHT22 / VOC / UV / MQ-135, packs into a struct,  ║
+ * ║  and sends to the hub node every 5 seconds via ESP-NOW.  ║
+ * ║                                                          ║
+ * ║  SETUP: Replace HUB_MAC below with the actual MAC        ║
+ * ║  address printed by the hub node on first boot.          ║
+ * ╚══════════════════════════════════════════════════════════╝
+ */
+
+#include <Arduino.h>
+#include <DHT.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ══════════════════════════════════════════════
+//  CONFIG — edit these per node
+// ══════════════════════════════════════════════
+
+// MAC address of the hub node (printed on hub's Serial at boot)
+uint8_t HUB_MAC[6] = {0x78, 0x1C, 0x3C, 0xB7, 0x99, 0x9C};
+
+// Give each node a unique ID (1, 2, 3 …)
+#define NODE_ID  1
+
+// ══════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ══════════════════════════════════════════════
+#define DHTPIN        4
+#define DHTTYPE       DHT22
+#define VOC_PIN       34
+#define UV_PIN        33
+#define UV_REF_PIN    27
+#define UV_EN_PIN     32
+#define MQ135_PIN     35
+#define LED_POWER     2
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// ══════════════════════════════════════════════
+//  SHARED DATA PACKET  (must match hub exactly)
+// ══════════════════════════════════════════════
+typedef struct SensorPacket {
+  uint8_t  nodeId;        // which node sent this
+  float    tempC;
+  float    humidity;
+  float    heatIndex;
+  float    vocVoltage;
+  float    vocDelta;
+  float    uvIndex;
+  float    uvVoltage;
+  float    uvRefVoltage;
+  float    mq135PPM;
+  float    mq135Voltage;
+  int      vocRaw;
+  int      uvRaw;
+  int      mqRaw;
+} SensorPacket;
+
+SensorPacket packet;
+
+// ══════════════════════════════════════════════
+//  CALIBRATION GLOBALS
+// ══════════════════════════════════════════════
+float vocBaselineV = 2.0;
+float mq135_R0     = 10000.0;
+const float RL     = 10000.0;
+
+// ══════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════
+int getAveragedRaw(int pin, int samples = 64) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) { sum += analogRead(pin); delay(2); }
+  return sum / samples;
+}
+
+float getCalibratedVoltage(int pin) {
+  int raw = getAveragedRaw(pin);
+  return -0.000000000000016  * pow(raw, 4)
+       +  0.000000000118171  * pow(raw, 3)
+       -  0.000000301211691  * pow(raw, 2)
+       +  0.001109019271794  * raw
+       +  0.034143524634089;
+}
+
+float mapFloat(float x, float in_min, float in_max,
+                        float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+float getUVIndex(float outV, float refV) {
+  float zeroUV = refV * 0.303;
+  float maxUV  = refV * 0.667;
+  if (outV < zeroUV) outV = zeroUV;
+  if (outV > maxUV)  outV = maxUV;
+  return mapFloat(outV, zeroUV, maxUV, 0.0, 11.0);
+}
+
+float getMQ135PPM(float voltage) {
+  if (voltage <= 0.1 || voltage >= 3.3) return 395.0;
+  float Rs    = ((3.3 * RL) / voltage) - RL;
+  float ratio = Rs / mq135_R0;
+  return 116.602 * pow(ratio, -2.769);
+}
+
+// ══════════════════════════════════════════════
+//  ESP-NOW CALLBACK
+// ══════════════════════════════════════════════
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("[ESP-NOW] Send to hub: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
+}
+
+
+// ══════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(LED_POWER, OUTPUT);
+  digitalWrite(LED_POWER, HIGH);
+  pinMode(UV_EN_PIN, OUTPUT);
+  digitalWrite(UV_EN_PIN, HIGH);
+
+  dht.begin();
+
+  // ── WiFi in STA mode (required for ESP-NOW) ──
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // ── ESP-NOW init ──────────────────────────
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] Init FAILED — halting.");
+    while (true) delay(1000);
+  }
+  esp_now_register_send_cb(onSent);
+
+  // ── Register hub as a peer ────────────────
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, HUB_MAC, 6);
+  peerInfo.channel = 0;   // 0 = current channel
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("[ESP-NOW] Add peer FAILED — check HUB_MAC.");
+  }
+
+  Serial.printf("\n[Node %d] Starting up — warming sensors (5 min)\n", NODE_ID);
+
+  // Warm-up countdown (non-blocking text ticks)
+  for (int i = 300; i > 0; i -= 10) {
+    Serial.printf("  ⏳ %ds remaining...\n", i);
+    delay(10000);
+  }
+
+  // Dynamic baseline calibration
+  vocBaselineV = getCalibratedVoltage(VOC_PIN);
+  float mqV    = getCalibratedVoltage(MQ135_PIN);
+  float Rs_cl  = ((3.3 * RL) / mqV) - RL;
+  mq135_R0     = Rs_cl / pow((395.0 / 116.602), (1.0 / -2.769));
+
+  Serial.printf("[Node %d] Calibration complete — polling every 5 s\n", NODE_ID);
+}
+
+// ══════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════
+void loop() {
+  // ── Read sensors ─────────────────────────
+  float humidity  = dht.readHumidity();
+  float tempC     = dht.readTemperature();
+  float heatIndex = (!isnan(tempC) && !isnan(humidity))
+                    ? dht.computeHeatIndex(tempC, humidity, false) : NAN;
+
+  int   vocRaw      = getAveragedRaw(VOC_PIN);
+  float vocVoltage  = getCalibratedVoltage(VOC_PIN);
+  float vocDelta    = vocVoltage - vocBaselineV;
+
+  int   uvRaw       = getAveragedRaw(UV_PIN);
+  float uvVoltage   = getCalibratedVoltage(UV_PIN);
+  float uvRefV      = 3.3;
+  float uvIndex     = getUVIndex(uvVoltage, uvRefV);
+
+  int   mqRaw       = getAveragedRaw(MQ135_PIN);
+  float mqVoltage   = getCalibratedVoltage(MQ135_PIN);
+  float mqPPM       = getMQ135PPM(mqVoltage);
+
+  // ── Fill packet ───────────────────────────
+  packet.nodeId       = NODE_ID;
+  packet.tempC        = tempC;
+  packet.humidity     = humidity;
+  packet.heatIndex    = heatIndex;
+  packet.vocVoltage   = vocVoltage;
+  packet.vocDelta     = vocDelta;
+  packet.uvIndex      = uvIndex;
+  packet.uvVoltage    = uvVoltage;
+  packet.uvRefVoltage = uvRefV;
+  packet.mq135PPM     = mqPPM;
+  packet.mq135Voltage = mqVoltage;
+  packet.vocRaw       = vocRaw;
+  packet.uvRaw        = uvRaw;
+  packet.mqRaw        = mqRaw;
+
+  // ── Transmit ──────────────────────────────
+  esp_now_send(HUB_MAC, (uint8_t *)&packet, sizeof(packet));
+
+  delay(5000);
+}
