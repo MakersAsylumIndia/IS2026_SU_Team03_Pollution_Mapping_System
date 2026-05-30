@@ -1,0 +1,405 @@
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+
+const char* ssid     = "Stardust";
+const char* password = "Savio@trek3900D";
+
+#define FORCED_CHANNEL 11
+
+WebServer server(80);
+
+const char* nodeNames[4] = {
+  "Makers Asylum, Goa",
+  "Calangute, Goa",
+  "Margao, Goa",
+  "Vasco da Gama, Goa"
+};
+float nodeLat[4] = { 15.595,  15.5440, 15.2832, 15.3982 };
+float nodeLon[4] = { 73.834,  73.7553, 73.9862, 73.8113 };
+
+typedef struct SensorPacket {
+  uint8_t  nodeId;
+  float    tempC;
+  float    humidity;
+  float    heatIndex;
+  float    vocVoltage;
+  float    vocDelta;
+  float    uvIndex;
+  float    uvVoltage;
+  float    uvRefVoltage;
+  float    mq135PPM;
+  float    mq135Voltage;
+  int      vocRaw;
+  int      uvRaw;
+  int      mqRaw;
+} SensorPacket;
+
+SensorPacket latest[4];
+bool dataReceived[4] = { false, false, false, false };
+
+String getHeatIndexLevel(float hi) {
+  if      (hi < 27) return "Comfortable  ✔";
+  else if (hi < 32) return "Warm         ⚠";
+  else if (hi < 40) return "Hot          ✘";
+  else              return "Danger       ✘✘";
+}
+String getVOCLevel(float delta) {
+  float d = abs(delta);
+  if      (d < 0.05) return "Clean Air    ✔✔";
+  else if (d < 0.15) return "Good         ✔";
+  else if (d < 0.30) return "Moderate     ⚠";
+  else if (d < 0.50) return "Poor         ✘";
+  else               return "Hazardous    ✘✘";
+}
+String getUVLevel(float uv) {
+  if      (uv < 3)  return "Low          ✔✔ (0-2)";
+  else if (uv < 6)  return "Moderate     ✔  (3-5)";
+  else if (uv < 8)  return "High         ⚠  (6-7)";
+  else if (uv < 11) return "Very High    ✘  (8-10)";
+  else              return "Extreme      ☠  (11+)";
+}
+String getMQ135Level(float ppm) {
+  if      (ppm < 450)  return "Excellent    ✔✔ (<450 ppm)";
+  else if (ppm < 1000) return "Good         ✔  (450-1000 ppm)";
+  else if (ppm < 2000) return "Moderate     ⚠  (1000-2000 ppm)";
+  else if (ppm < 5000) return "Poor         ✘  (2000-5000 ppm)";
+  else                 return "Hazardous    ✘✘ (>5000 ppm)";
+}
+
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(SensorPacket)) {
+    Serial.printf("[HUB] Bad packet size %d (expected %d)\n", len, sizeof(SensorPacket));
+    return;
+  }
+  SensorPacket p;
+  memcpy(&p, data, sizeof(SensorPacket));
+
+  int idx = (int)p.nodeId - 1;
+  if (idx < 0 || idx > 3) {
+    Serial.printf("[HUB] nodeId %d out of range\n", p.nodeId);
+    return;
+  }
+  memcpy(&latest[idx], &p, sizeof(SensorPacket));
+  dataReceived[idx] = true;
+
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+    info->src_addr[0], info->src_addr[1], info->src_addr[2],
+    info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+
+  Serial.printf("[HUB] ✅ Packet from Node %d  MAC:%s  temp=%.1f  humi=%.1f\n",
+    p.nodeId, macStr, p.tempC, p.humidity);
+}
+
+const char* htmlPage = R"rawHTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="10">
+<title>Goa Weather Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0f1117; color: #e8eaf0; min-height: 100vh; }
+  header { padding: 1.2rem 1.5rem; background: #1a1d26; border-bottom: 1px solid #2a2d3a;
+           display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 1.1rem; font-weight: 500; color: #c8cfe0; }
+  header span { font-size: 12px; color: #606880; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #1D9E75;
+         box-shadow: 0 0 6px #1D9E75; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; height: calc(100vh - 56px); }
+  #map { height: 100%; min-height: 300px; }
+  .panel { padding: 1.2rem; overflow-y: auto; background: #13151e; }
+  .node-section { margin-bottom: 1.2rem; border: 1px solid #2a2d3a;
+                  border-radius: 14px; overflow: hidden; }
+  .node-header { display: flex; align-items: center; justify-content: space-between;
+                 padding: 10px 14px; background: #1a1d26; cursor: pointer; user-select: none; }
+  .node-header h2 { font-size: 13px; font-weight: 500; color: #c8cfe0;
+                    text-transform: uppercase; letter-spacing: 0.08em; }
+  .node-header .chevron { font-size: 11px; color: #606880; transition: transform 0.2s; }
+  .node-header.open .chevron { transform: rotate(180deg); }
+  .node-body { padding: 1rem; background: #13151e; display: none; }
+  .node-body.open { display: block; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { background: #1a1d26; border: 1px solid #2a2d3a; border-radius: 12px; padding: 14px 16px; }
+  .card .icon { font-size: 22px; margin-bottom: 8px; }
+  .card .label { font-size: 11px; color: #606880; text-transform: uppercase;
+                 letter-spacing: 0.06em; margin-bottom: 4px; }
+  .card .value { font-size: 26px; font-weight: 500; line-height: 1; }
+  .card .unit  { font-size: 13px; color: #808898; margin-left: 3px; }
+  .card .sublabel { font-size: 11px; color: #606880; margin-top: 5px; }
+  .card .bar-track { height: 4px; border-radius: 2px; background: #2a2d3a;
+                     margin-top: 10px; overflow: hidden; }
+  .card .bar-fill  { height: 100%; border-radius: 2px; }
+  .c-temp .value { color: #EF9F27; } .c-temp .bar-fill { background: #EF9F27; }
+  .c-humi .value { color: #5DCAA5; } .c-humi .bar-fill { background: #5DCAA5; }
+  .c-uv   .value { color: #AFA9EC; } .c-uv   .bar-fill { background: #AFA9EC; }
+  .c-voc  .value { color: #F09595; } .c-voc  .bar-fill { background: #F09595; }
+  .c-co2  .value { color: #78b4f0; } .c-co2  .bar-fill { background: #78b4f0; }
+  .c-hi   .value { color: #f0c478; } .c-hi   .bar-fill { background: #f0c478; }
+  .status-row { margin-top: 14px; padding: 12px 14px; background: #1a1d26;
+                border: 1px solid #2a2d3a; border-radius: 12px; }
+  .status-row p { font-size: 12px; color: #606880; margin-bottom: 2px; }
+  .status-row strong { font-size: 14px; color: #c8cfe0; font-weight: 500; }
+  .aqi-badge { display: inline-block; padding: 2px 10px; border-radius: 20px;
+               font-size: 11px; font-weight: 500; margin-top: 6px; }
+  .aqi-good { background: #085041; color: #5DCAA5; }
+  .aqi-mod  { background: #633806; color: #EF9F27; }
+  .aqi-high { background: #791F1F; color: #F09595; }
+  .no-data  { padding: 10px 14px; color: #606880; font-size: 12px; font-style: italic; }
+  .pulse-marker { position: relative; width: 22px; height: 22px; }
+  .pulse-marker .ring { position: absolute; inset: 0; border-radius: 50%;
+    animation: markerPulse 2s ease-out infinite; opacity: 0; }
+  .pulse-marker .dot-inner { position: absolute; inset: 4px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.8); }
+  @keyframes markerPulse {
+    0%   { transform: scale(0.6); opacity: 0.8; }
+    70%  { transform: scale(2.2); opacity: 0; }
+    100% { transform: scale(2.2); opacity: 0; }
+  }
+  .leaflet-popup-content { font-size: 13px; line-height: 1.6; min-width: 180px; }
+  .popup-status { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                  font-size: 11px; font-weight: 600; margin-top: 4px; color: #fff; }
+  .popup-legend { margin-top: 8px; border-top: 1px solid #ddd; padding-top: 6px; }
+  .popup-legend-row { display: flex; align-items: center; gap: 6px;
+                      font-size: 11px; color: #555; line-height: 1.8; }
+  .popup-legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  @media (max-width: 640px) {
+    .main { grid-template-columns: 1fr; grid-template-rows: 45vh auto; }
+    #map  { height: 45vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div>
+  <h1>Goa Environmental Monitor — 4 Nodes</h1>
+  <span id="ts"></span>
+</header>
+<div class="main">
+  <div id="map"></div>
+  <div class="panel">%NODE_SECTIONS%</div>
+</div>
+<script>
+document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+var nodes = %NODES_JSON%;
+var map = L.map('map', { zoomControl: true }).setView([15.4000, 73.8500], 10);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors', maxZoom: 19
+}).addTo(map);
+for (var i = 0; i < nodes.length; i++) {
+  var n = nodes[i];
+  var markerHtml =
+    '<div class="pulse-marker">' +
+      '<div class="ring" style="background:' + n.color + ';"></div>' +
+      '<div class="dot-inner" style="background:' + n.color + ';"></div>' +
+    '</div>';
+  var icon = L.divIcon({ className: '', html: markerHtml,
+    iconSize: [22,22], iconAnchor: [11,11], popupAnchor: [0,-14] });
+  var readingsHtml = n.hasData
+    ? ('🌡️ ' + n.temp + ' °C &nbsp; 💧 ' + n.humi + '% &nbsp; ☀️ UV ' + n.uv +
+       ' &nbsp; 💨 ' + n.co2 + ' ppm<br>' +
+       '<span class="popup-status" style="background:' + n.color + ';">' + n.label + '</span>')
+    : '<i style="color:#888;">Waiting for first packet...</i>';
+  var popupHtml =
+    '<b style="font-size:13px">Node ' + n.id + ' — ' + n.name + '</b><br>' +
+    readingsHtml +
+    '<div class="popup-legend">' +
+      '<div class="popup-legend-row"><div class="popup-legend-dot" style="background:#1D9E75;"></div>Green — temp≤30°C, humi≤70%, UV≤5, CO2≤1000</div>' +
+      '<div class="popup-legend-row"><div class="popup-legend-dot" style="background:#EF9F27;"></div>Yellow — temp≤38°C, humi≤85%, UV≤8, CO2≤2000</div>' +
+      '<div class="popup-legend-row"><div class="popup-legend-dot" style="background:#E24B4A;"></div>Red — above yellow limits</div>' +
+    '</div>';
+  L.marker([n.lat, n.lon], { icon: icon }).addTo(map).bindPopup(popupHtml, { maxWidth: 280 });
+}
+var headers = document.querySelectorAll('.node-header');
+for (var j = 0; j < headers.length; j++) {
+  headers[j].addEventListener('click', function() {
+    this.classList.toggle('open');
+    this.nextElementSibling.classList.toggle('open');
+  });
+}
+</script>
+</body>
+</html>
+)rawHTML";
+
+String fmtFloat(float v, int dec) {
+  if (isnan(v)) return "--";
+  return String(v, dec);
+}
+
+void getSeverity(int idx, String &color, String &label, String &badgeClass, String &badgeLabel) {
+  if (!dataReceived[idx]) {
+    color = "#606880"; label = "Waiting";
+    badgeClass = "aqi-good"; badgeLabel = "Waiting...";
+    return;
+  }
+  SensorPacket &p = latest[idx];
+  bool isRed =
+    (!isnan(p.tempC)    && p.tempC    > 38) ||
+    (!isnan(p.humidity) && p.humidity > 85) ||
+    (p.uvIndex > 8) ||
+    (abs(p.vocDelta) > 0.30) ||
+    (p.mq135PPM > 2000);
+  bool isYellow =
+    (!isnan(p.tempC)    && p.tempC    > 30) ||
+    (!isnan(p.humidity) && p.humidity > 70) ||
+    (p.uvIndex > 5) ||
+    (abs(p.vocDelta) > 0.15) ||
+    (p.mq135PPM > 1000);
+  if (isRed)         { color = "#E24B4A"; label = "Alert";    badgeClass = "aqi-high"; badgeLabel = "Alert"; }
+  else if (isYellow) { color = "#EF9F27"; label = "Moderate"; badgeClass = "aqi-mod";  badgeLabel = "Moderate"; }
+  else               { color = "#1D9E75"; label = "Good";     badgeClass = "aqi-good"; badgeLabel = "Good"; }
+}
+
+String buildNodeCards(int idx) {
+  if (!dataReceived[idx])
+    return "<div class='no-data'>⏳ No packets yet — waiting for node " + String(idx+1) + "...</div>";
+
+  SensorPacket &p = latest[idx];
+  float tempBar = isnan(p.tempC)    ? 0 : constrain(p.tempC    / 50.0  * 100.0, 0, 100);
+  float humiBar = isnan(p.humidity) ? 0 : constrain(p.humidity,                  0, 100);
+  float uvBar   =                         constrain(p.uvIndex   / 11.0  * 100.0, 0, 100);
+  float vocBar  =                         constrain(abs(p.vocDelta)/0.5  * 100.0, 0, 100);
+  float co2Bar  =                         constrain(p.mq135PPM  / 5000.0* 100.0, 0, 100);
+  float hiBar   = isnan(p.heatIndex)? 0 : constrain(p.heatIndex / 50.0  * 100.0, 0, 100);
+
+  String badgeColor, markerLabel, badgeClass, badgeLabel;
+  getSeverity(idx, badgeColor, markerLabel, badgeClass, badgeLabel);
+
+  String s = "<div class='cards'>";
+
+  s += "<div class='card c-temp'><div class='icon'>🌡️</div><div class='label'>Temperature</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.tempC,1) + "</span><span class='unit'>°C</span></div>";
+  s += "<div class='sublabel'>" + getHeatIndexLevel(isnan(p.heatIndex)?0:p.heatIndex) + "</div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(tempBar,1) + "%'></div></div></div>";
+
+  s += "<div class='card c-humi'><div class='icon'>💧</div><div class='label'>Humidity</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.humidity,1) + "</span><span class='unit'>%</span></div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(humiBar,1) + "%'></div></div></div>";
+
+  s += "<div class='card c-uv'><div class='icon'>☀️</div><div class='label'>UV Index</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.uvIndex,1) + "</span><span class='unit'>UVI</span></div>";
+  s += "<div class='sublabel'>" + getUVLevel(p.uvIndex) + "</div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(uvBar,1) + "%'></div></div></div>";
+
+  s += "<div class='card c-voc'><div class='icon'>🌫️</div><div class='label'>VOC Air</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.vocDelta,3) + "</span><span class='unit'>V delta</span></div>";
+  s += "<div class='sublabel'>" + getVOCLevel(p.vocDelta) + "</div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(vocBar,1) + "%'></div></div></div>";
+
+  s += "<div class='card c-co2'><div class='icon'>💨</div><div class='label'>CO2 MQ-135</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.mq135PPM,0) + "</span><span class='unit'>ppm</span></div>";
+  s += "<div class='sublabel'>" + getMQ135Level(p.mq135PPM) + "</div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(co2Bar,1) + "%'></div></div></div>";
+
+  s += "<div class='card c-hi'><div class='icon'>🌡️</div><div class='label'>Heat Index</div>";
+  s += "<div><span class='value'>" + fmtFloat(p.heatIndex,1) + "</span><span class='unit'>°C</span></div>";
+  s += "<div class='sublabel'>Feels like</div>";
+  s += "<div class='bar-track'><div class='bar-fill' style='width:" + String(hiBar,1) + "%'></div></div></div>";
+
+  s += "</div>";
+  s += "<div class='status-row'><p>Location</p><strong>" + String(nodeNames[idx]) + "</strong>";
+  s += "<div class='aqi-badge " + badgeClass + "'>" + badgeLabel + "</div></div>";
+  return s;
+}
+
+String buildPage() {
+  String html = String(htmlPage);
+  String sections = "";
+  for (int i = 0; i < 4; i++) {
+    String color, label, badgeClass, badgeLabel;
+    getSeverity(i, color, label, badgeClass, badgeLabel);
+    String headerClass = (i == 0) ? "node-header open" : "node-header";
+    String bodyClass   = (i == 0) ? "node-body open"   : "node-body";
+    sections += "<div class='node-section'>";
+    sections += "<div class='" + headerClass + "'>";
+    sections += "<h2>&#9679; Node " + String(i+1) + " — " + String(nodeNames[i]) + "</h2>";
+    sections += "<span class='chevron'>▼</span></div>";
+    sections += "<div class='" + bodyClass + "'>" + buildNodeCards(i) + "</div></div>";
+  }
+  html.replace("%NODE_SECTIONS%", sections);
+
+  String json = "[";
+  for (int i = 0; i < 4; i++) {
+    String color, label, badgeClass, badgeLabel;
+    getSeverity(i, color, label, badgeClass, badgeLabel);
+    json += "{";
+    json += "\"id\":"      + String(i+1)                                      + ",";
+    json += "\"name\":\""  + String(nodeNames[i])                             + "\",";
+    json += "\"lat\":"     + String(nodeLat[i], 4)                            + ",";
+    json += "\"lon\":"     + String(nodeLon[i], 4)                            + ",";
+    json += "\"color\":\"" + color                                             + "\",";
+    json += "\"label\":\"" + label                                             + "\",";
+    json += "\"hasData\":" + String(dataReceived[i] ? "true" : "false")       + ",";
+    json += "\"temp\":\""  + fmtFloat(latest[i].tempC,    1)                  + "\",";
+    json += "\"humi\":\""  + fmtFloat(latest[i].humidity, 1)                  + "\",";
+    json += "\"uv\":\""    + fmtFloat(latest[i].uvIndex,  1)                  + "\",";
+    json += "\"co2\":\""   + fmtFloat(latest[i].mq135PPM, 0)                  + "\"";
+    json += "}";
+    if (i < 3) json += ",";
+  }
+  json += "]";
+  html.replace("%NODES_JSON%", json);
+  return html;
+}
+
+void handleRoot() { server.send(200, "text/html", buildPage()); }
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ── Step 1: Set mode FIRST ──────────────────────────────────────────
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(200);
+
+  // ── Step 2: Force channel 1 BEFORE esp_now_init ────────────────────
+  esp_wifi_set_channel(FORCED_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  Serial.println("\n##############################################");
+  Serial.println("#   HUB NODE — ESP-NOW + WEB DASHBOARD      #");
+  Serial.println("##############################################");
+  Serial.printf("  Hub MAC  : %s\n", WiFi.macAddress().c_str());
+  Serial.printf("  Channel  : %d\n", WiFi.channel());
+  Serial.println("  Paste the MAC above into HUB_MAC[] on every sensor node.");
+  Serial.println("##############################################\n");
+
+  // ── Step 3: ESP-NOW init ───────────────────────────────────────────
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[HUB] ESP-NOW init FAILED — halting.");
+    while (true) delay(1000);
+  }
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("[HUB] ESP-NOW ready on channel 1");
+
+  // ── Step 4: Connect WiFi (may shift channel — we re-lock after) ───
+  Serial.print("[HUB] Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[HUB] WiFi connected!");
+  Serial.printf("[HUB] Router channel: %d\n", WiFi.channel());
+
+  // ── Step 5: Re-lock to channel 11 after WiFi connects ──────────────
+  esp_wifi_set_channel(FORCED_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[HUB] Forced back to channel 1. Current: %d\n", WiFi.channel());
+
+  Serial.printf("[HUB] Dashboard at: http://%s\n", WiFi.localIP().toString().c_str());
+
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("[HUB] Web server started.");
+}
+
+void loop() {
+  server.handleClient();
+}
