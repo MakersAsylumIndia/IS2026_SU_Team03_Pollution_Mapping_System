@@ -24,7 +24,15 @@ MIT open source [license](http://opensource.org/licenses/MIT).
 ## 📬 Contact/Team
 
 > _List team members and contact emails or GitHub profiles._
-[@anool](https://github.com/Anool)
+
+[Nishka Reddy Bhimavarapu](https://github.com/nishkareddy01)
+
+[Kahaan Shah](https://github.com/KSupahHero)
+
+[Arjun Dhanuka](https://github.com/Arjun123465274)
+
+[Maker's Asylum](https://github.com/makersasylum)
+
+[Anool](https://github.com/Anool)
 > 
->
 > ---
