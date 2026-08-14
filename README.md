@@ -1,8 +1,11 @@
-# IS2026 Spring - NAME OF PROJECT
+# IS2026_SU_Team03_Pollution_Mapping_System
 
 Describe the project.
-Describe what are the contents of each folder - CODE, CAD, Electronics etc
+An air quality sensing system that has multiple nodes around the area, collects real-time readings (CO₂, VOCs, temp), & sends data to a live dashboard. The dashboard shows a live map, graphs over time, and pollution alerts. The idea is that government air sensors are spaced way too far apart while ours can detect local pollution that those miss.
 
+Air quality and environmental conditions like UV levels, humidity, temperature, CO₂ and VOCs are rarely monitored in real time across multiple locations. Single-point sensors give incomplete data, and people have no easy way to know what the air around them is actually like. These single-point sensors are also extremely expensive, and they only give data in one location, not showing the difference in these levels in different areas. Moreover, the weather app shows data of the whole city instead of specific locations.
+
+A network of ESP32-based sensor nodes that each measure temperature, humidity, CO₂, VOC, heat index and UV levels. Each node transmits its data wirelessly to a central system which displays live readings to users using the ESP-NOW protocol. An interactive map shows all active nodes and their readings, giving a complete picture of environmental conditions across multiple locations in real time.
 
 ## License
 
